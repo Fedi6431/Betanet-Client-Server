@@ -14,12 +14,12 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 # --- Constants ---
-# Betanet protocol version (as per spec)
+# Betanet protocol version (as per specification)
 BETANET_VERSION = b"\x02"
-# SCION packet types (as per spec)
+# SCION packet types (as per specification)
 SCION_TYPE_SINGLE_PATH = 0x01
 SCION_TYPE_PATH_LIST = 0x03
-# HTX ALPN identifier (as per spec)
+# HTX ALPN identifier (as per specification)
 HTX_ALPN = b"htx/1.1.0"
 # Randomly generated ticket key ID and public key for access ticket system
 TICKET_KEY_ID = os.urandom(8)
@@ -29,11 +29,11 @@ TICKET_PUB = x25519.X25519PrivateKey.generate().public_key()
 @dataclass
 class SCIONHeader:
     """Represents a SCION packet header."""
-    ver: int       # Protocol version
-    type: int      # Packet type (single path or path list)
+    ver: int           # Protocol version
+    type: int          # Packet type (single path or path list)
     total_length: int  # Total length of the header + payload
-    payload_length: int  # Length of the payload
-    path_segments: bytes  # Path segments for SCION routing
+    payload_length: int # Length of the payload
+    path_segments: bytes # Path segments for SCION routing
 
 @dataclass
 class HTXFrame:
@@ -64,7 +64,15 @@ class BetanetClient:
         return hashlib.sha256(data).digest()
 
     def hkdf(self, ikm: bytes, salt: bytes, info: bytes, length: int) -> bytes:
-        """Derive a key using HKDF-SHA256."""
+        """Derive a key using HKDF-SHA256.
+        Args:
+            ikm: Input key material.
+            salt: Optional salt value.
+            info: Application-specific context.
+            length: Length of the output key.
+        Returns:
+            Derived key material.
+        """
         return HKDF(
             algorithm=hashes.SHA256(),
             length=length,
@@ -74,14 +82,11 @@ class BetanetClient:
         ).derive(ikm)
 
     def generate_access_ticket(self, ticket_pub: bytes, ticket_key_id: bytes, hour: int) -> Tuple[bytes, bytes]:
-        """
-        Generate an access ticket for Betanet authentication.
-
+        """Generate an access ticket for Betanet authentication.
         Args:
             ticket_pub: Server's public key for ticket generation.
             ticket_key_id: Unique identifier for the ticket key.
             hour: Current hour (floor of Unix time / 3600).
-
         Returns:
             Tuple of (client public key, access ticket).
         """
@@ -98,13 +103,10 @@ class BetanetClient:
         return cli_pub.public_bytes(Encoding.Raw, PublicFormat.Raw), access_ticket
 
     def create_scion_header(self, path_segments: bytes, payload: bytes) -> bytes:
-        """
-        Create a SCION packet header.
-
+        """Create a SCION packet header.
         Args:
             path_segments: SCION path segments.
             payload: Payload to be sent.
-
         Returns:
             Bytes representing the SCION header + payload.
         """
@@ -119,16 +121,13 @@ class BetanetClient:
         return header + payload
 
     def create_htx_frame(self, frame_type: int, stream_id: int, plaintext: bytes, key: bytes, nonce_salt: bytes) -> bytes:
-        """
-        Create an HTX frame (encrypted and formatted).
-
+        """Create an HTX frame (encrypted and formatted).
         Args:
             frame_type: Type of the frame (e.g., 0 for STREAM).
             stream_id: Stream identifier.
             plaintext: Data to encrypt.
             key: Encryption key.
             nonce_salt: Salt for nonce generation.
-
         Returns:
             Bytes representing the HTX frame.
         """
@@ -147,22 +146,73 @@ class BetanetClient:
         self.counter += 1
         return frame
 
-    def connect(self, host: str, port: int):
-        """
-        Connect to a Betanet server and send a test frame.
-
+    def parse_htx_frame(self, data: bytes, key: bytes, nonce_salt: bytes) -> Optional[HTXFrame]:
+        """Parse an HTX frame.
         Args:
-            host: Server hostname or IP.
+            data: Raw frame data.
+            key: Decryption key.
+            nonce_salt: Salt for nonce generation.
+        Returns:
+            Parsed HTXFrame object, or None if parsing fails.
+        """
+        if len(data) < 5:
+            return None
+        length, type_ = struct.unpack(">IB", data[:5])
+        offset = 5
+        stream_id = 0
+        if type_ == 0:  # STREAM
+            stream_id = struct.unpack(">Q", data[5:13])[0]
+            offset = 13
+        ciphertext = data[offset:offset + length + 16]
+        aead = ChaCha20Poly1305(key)
+        nonce = nonce_salt[:4] + struct.pack("<Q", self.counter)
+        try:
+            plaintext = aead.decrypt(nonce, ciphertext, None)
+            self.counter += 1
+            return HTXFrame(length, type_, stream_id, plaintext)
+        except Exception as e:
+            print(f"Decryption failed: {e}")
+            return None
+
+    def connect(self, host: str, port: int):
+        """Establish a connection to the Betanet server.
+        Args:
+            host: Server hostname or IP address.
             port: Server port.
         """
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((host, port))
-            # In a real implementation, perform TLS handshake and HTX calibration here
             print(f"Connected to {host}:{port}")
-            # Example: Send a dummy HTX frame
-            # Note: In a real scenario, use proper session keys and nonce salts
-            dummy_frame = self.create_htx_frame(0, 1, b"Hello, Betanet!", os.urandom(32), os.urandom(12))
-            s.sendall(dummy_frame)
+            # Generate and send a shared key and nonce salt
+            shared_key = os.urandom(32)
+            nonce_salt = os.urandom(12)
+            s.sendall(shared_key + nonce_salt)
+            self.counter = 0  # Reset counter for this session
+            try:
+                while True:
+                    # Get user input
+                    message = input("Enter message to send (or 'quit' to exit): ").encode('utf-8')
+                    if message.lower() == b'quit':
+                        # Send a CLOSE frame
+                        close_frame = self.create_htx_frame(2, 0, b"", shared_key, nonce_salt)
+                        s.sendall(close_frame)
+                        break
+                    # Create and send an HTX frame
+                    frame = self.create_htx_frame(0, 1, message, shared_key, nonce_salt)
+                    s.sendall(frame)
+                    # Receive and print the server's response
+                    response = s.recv(1024)
+                    if not response:
+                        break
+                    # Parse and print the response
+                    htx_frame = self.parse_htx_frame(response, shared_key, nonce_salt)
+                    if htx_frame:
+                        print(f"Server response: {htx_frame.ciphertext.decode('utf-8', errors='ignore')}")
+            except Exception as e:
+                print(f"Error: {e}")
+            finally:
+                s.close()
+                print("Connection closed.")
 
 # --- Main Execution ---
 if __name__ == "__main__":
